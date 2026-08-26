@@ -2,6 +2,8 @@
 
 基于 Rime 的终端中文输入法前端。`rime-fep` 在 PTY 中运行 shell 或其他命令，并使用终端最后一行显示输入状态和候选词，适用于本地终端和 SSH。
 
+![rime-fep](assets/screenshot.png)
+
 ## 构建
 
 需要 Rust、C 编译器，以及 librime 和 OpenCC。macOS 可通过 Homebrew 安装运行库：
