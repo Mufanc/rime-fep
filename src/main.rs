@@ -148,6 +148,7 @@ fn arguments() -> Result<(Option<PathBuf>, CommandBuilder), Box<dyn std::error::
     };
     let mut command = CommandBuilder::new(program);
 
+    command.cwd(env::current_dir()?);
     command.args(command_parts);
     Ok((arguments.config_dir, command))
 }
