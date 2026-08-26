@@ -1,0 +1,12 @@
+[submodule "vendor/rime-prelude"]
+	path = vendor/rime-prelude
+	url = https://github.com/rime/rime-prelude.git
+[submodule "vendor/rime-luna-pinyin"]
+	path = vendor/rime-luna-pinyin
+	url = https://github.com/rime/rime-luna-pinyin.git
+[submodule "vendor/rime-essay"]
+	path = vendor/rime-essay
+	url = https://github.com/rime/rime-essay.git
+[submodule "vendor/rime-stroke"]
+	path = vendor/rime-stroke
+	url = https://github.com/rime/rime-stroke.git
