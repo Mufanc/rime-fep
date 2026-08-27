@@ -12,14 +12,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
+use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::Print;
+use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize};
 use signal_hook::consts::signal::SIGWINCH;
 use signal_hook::iterator::Signals;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use vt100::{Parser as VtParser, Screen};
 
 use self::input::InputMethod;
 
@@ -32,6 +33,12 @@ enum Event {
 }
 
 struct RawMode;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Popup {
+    row: u16,
+    col: u16,
+}
 
 #[derive(Parser)]
 #[command(version, trailing_var_arg = true)]
@@ -75,7 +82,7 @@ fn run() -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let mut input_method = InputMethod::new(config_dir.as_deref())?;
     let mut size = terminal_size()?;
     let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system.openpty(child_size(size))?;
+    let pair = pty_system.openpty(size)?;
     let mut child = pair.slave.spawn_command(command)?;
 
     drop(pair.slave);
@@ -114,8 +121,8 @@ fn run_proxy(
     spawn_resize_listener(sender)?;
 
     let mut stdout = io::stdout().lock();
-
-    prepare_screen(&mut stdout, *size, &input_method.status())?;
+    let mut parser = VtParser::new(size.rows, size.cols, 0);
+    let mut popup = None;
 
     let result = proxy_loop(
         &receiver,
@@ -125,9 +132,11 @@ fn run_proxy(
         &mut stdout,
         size,
         input_method,
+        &mut parser,
+        &mut popup,
     );
 
-    let cleanup = restore_screen(&mut stdout, *size);
+    let cleanup = redraw_popup(&mut stdout, parser.screen(), &mut popup, None, *size);
 
     match result {
         Err(error) => Err(error),
@@ -153,6 +162,7 @@ fn arguments() -> Result<(Option<PathBuf>, CommandBuilder), Box<dyn std::error::
     Ok((arguments.config_dir, command))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn proxy_loop(
     receiver: &Receiver<Event>,
     master: &dyn MasterPty,
@@ -161,10 +171,12 @@ fn proxy_loop(
     stdout: &mut impl Write,
     size: &mut PtySize,
     input_method: &mut InputMethod,
+    parser: &mut VtParser,
+    popup: &mut Option<Popup>,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let mut status = None;
     let mut output_closed = false;
-    let mut status_dirty = false;
+    let mut popup_dirty = false;
     let mut last_draw = Instant::now();
 
     while status.is_none() || !output_closed {
@@ -174,33 +186,51 @@ fn proxy_loop(
                     writer.write_all(&input_method.route(&bytes))?;
                     writer.flush()?;
                 }
-                draw_status(stdout, *size, &input_method.status())?;
-                status_dirty = false;
+                let text = input_method.popup();
+                redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
+                popup_dirty = false;
                 last_draw = Instant::now();
             }
             Ok(Event::InputClosed) => {
                 pty_writer.take();
             }
             Ok(Event::Output(bytes)) => {
+                if popup.is_some() {
+                    redraw_popup(stdout, parser.screen(), popup, None, *size)?;
+                }
+                parser.process(&bytes);
                 stdout.write_all(&bytes)?;
                 stdout.flush()?;
-                status_dirty = true;
+                popup_dirty = true;
             }
             Ok(Event::OutputClosed) => output_closed = true,
             Ok(Event::Resize) => {
+                popup.take();
                 *size = terminal_size()?;
-                master.resize(child_size(*size))?;
-                draw_status(stdout, *size, &input_method.status())?;
-                status_dirty = false;
+                master.resize(*size)?;
+                parser.screen_mut().set_size(size.rows, size.cols);
+                stdout.write_all(&parser.screen().state_formatted())?;
+                stdout.flush()?;
+                let text = input_method.popup();
+                redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
+                popup_dirty = false;
                 last_draw = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        if status_dirty && last_draw.elapsed() >= Duration::from_millis(16) {
-            draw_status(stdout, *size, &input_method.status())?;
-            status_dirty = false;
+        if input_method.expire_notice() {
+            let text = input_method.popup();
+            redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
+            popup_dirty = false;
+            last_draw = Instant::now();
+        }
+
+        if popup_dirty && last_draw.elapsed() >= Duration::from_millis(16) {
+            let text = input_method.popup();
+            redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
+            popup_dirty = false;
             last_draw = Instant::now();
         }
 
@@ -259,83 +289,84 @@ fn terminal_size() -> io::Result<PtySize> {
     })
 }
 
-fn child_size(mut size: PtySize) -> PtySize {
-    let outer_rows = size.rows;
+fn redraw_popup(
+    stdout: &mut impl Write,
+    screen: &Screen,
+    popup: &mut Option<Popup>,
+    text: Option<&str>,
+    size: PtySize,
+) -> io::Result<()> {
+    let old_popup = popup.take();
+    let new_popup = text.and_then(|text| popup_content(screen, size, text));
 
-    size.rows = size.rows.saturating_sub(1).max(1);
-
-    if outer_rows > 0 {
-        size.pixel_height =
-            (u32::from(size.pixel_height) * u32::from(size.rows) / u32::from(outer_rows)) as u16;
-    }
-
-    size
-}
-
-fn draw_status(stdout: &mut impl Write, size: PtySize, status: &str) -> io::Result<()> {
-    if size.rows < 2 {
+    if old_popup.is_none() && new_popup.is_none() {
         return Ok(());
     }
 
-    set_scroll_region(stdout, size)?;
+    if let Some(old_popup) = old_popup {
+        restore_popup(stdout, screen, old_popup)?;
+    }
 
-    let status = fit_status(status, size.cols.saturating_sub(1));
-
-    // Fixme: The terminal-global cursor save slot is also available to the child; track VT state instead.
-    queue!(
-        stdout,
-        SavePosition,
-        MoveTo(0, size.rows - 1),
-        Clear(ClearType::CurrentLine),
-        Print(status),
-        RestorePosition
-    )?;
-    stdout.flush()
-}
-
-fn prepare_screen(stdout: &mut impl Write, size: PtySize, status: &str) -> io::Result<()> {
-    if size.rows >= 2 {
+    if let Some((new_popup, text)) = new_popup {
         queue!(
             stdout,
-            MoveTo(0, size.rows - 2),
-            Clear(ClearType::CurrentLine)
+            MoveTo(new_popup.col, new_popup.row),
+            SetAttribute(Attribute::Reset),
+            SetAttribute(Attribute::Reverse),
+            Print(text),
+            SetAttribute(Attribute::Reset)
         )?;
+        *popup = Some(new_popup);
     }
-    draw_status(stdout, size, status)
+
+    stdout.write_all(&screen.cursor_state_formatted())?;
+    stdout.write_all(&screen.attributes_formatted())?;
+    stdout.flush()
 }
 
-fn set_scroll_region(stdout: &mut impl Write, size: PtySize) -> io::Result<()> {
-    if size.rows >= 2 {
-        write!(stdout, "\x1b7\x1b[1;{}r\x1b8", size.rows - 1)?;
-    }
-    Ok(())
-}
-
-fn clear_status(stdout: &mut impl Write, size: PtySize) -> io::Result<()> {
-    if size.rows < 2 {
+fn restore_popup(stdout: &mut impl Write, screen: &Screen, popup: Popup) -> io::Result<()> {
+    let (_, columns) = screen.size();
+    let Some(row) = screen
+        .rows_formatted(0, columns)
+        .nth(usize::from(popup.row))
+    else {
         return Ok(());
-    }
+    };
 
     queue!(
         stdout,
-        SavePosition,
-        MoveTo(0, size.rows - 1),
-        Clear(ClearType::CurrentLine),
-        RestorePosition
+        MoveTo(0, popup.row),
+        SetAttribute(Attribute::Reset),
+        Clear(ClearType::CurrentLine)
     )?;
-    stdout.flush()
+    stdout.write_all(&row)
 }
 
-fn restore_screen(stdout: &mut impl Write, size: PtySize) -> io::Result<()> {
-    clear_status(stdout, size)?;
-    write!(stdout, "\x1b7\x1b[r\x1b8")?;
-    stdout.flush()
+fn popup_content(screen: &Screen, size: PtySize, text: &str) -> Option<(Popup, String)> {
+    if size.rows < 2 || size.cols == 0 {
+        return None;
+    }
+
+    let text = fit_text(&format!(" {text} "), size.cols);
+    let width = u16::try_from(UnicodeWidthStr::width(text.as_str())).ok()?;
+    if width == 0 {
+        return None;
+    }
+
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let row = if cursor_row.saturating_add(1) < size.rows {
+        cursor_row + 1
+    } else {
+        cursor_row.saturating_sub(1)
+    };
+    let col = cursor_col.min(size.cols.saturating_sub(width));
+
+    Some((Popup { row, col }, text))
 }
 
-fn fit_status(status: &str, columns: u16) -> String {
+fn fit_text(text: &str, columns: u16) -> String {
     let mut width = 0;
-    status
-        .chars()
+    text.chars()
         .take_while(|character| {
             let character_width = UnicodeWidthChar::width(*character).unwrap_or(0);
             if width + character_width > usize::from(columns) {
@@ -352,38 +383,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reserves_one_row_for_status() {
+    fn places_popup_below_or_above_cursor() {
         let size = PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 800,
-            pixel_height: 480,
+            rows: 3,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
         };
+        let mut parser = VtParser::new(size.rows, size.cols, 0);
 
-        assert_eq!(child_size(size).rows, 23);
-        assert_eq!(child_size(size).pixel_height, 460);
-        assert_eq!(child_size(PtySize { rows: 1, ..size }).rows, 1);
+        assert_eq!(
+            popup_content(parser.screen(), size, "[中] a")
+                .unwrap()
+                .0
+                .row,
+            1
+        );
+        parser.process(b"\r\n\r\n");
+        assert_eq!(
+            popup_content(parser.screen(), size, "[中] a")
+                .unwrap()
+                .0
+                .row,
+            1
+        );
     }
 
     #[test]
-    fn clips_status_by_display_width() {
-        assert_eq!(fit_status("[中] nihao", 8), "[中] nih");
+    fn clips_popup_by_display_width() {
+        assert_eq!(fit_text(" [中] nihao ", 8), " [中] ni");
     }
 
     #[test]
-    fn reserves_status_row_in_terminal_scroll_region() {
+    fn restores_content_covered_by_popup() {
+        let size = PtySize {
+            rows: 3,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut background = VtParser::new(size.rows, size.cols, 0);
+        background.process(b"first\r\nsecond\r\nthird");
+        let mut displayed = VtParser::new(size.rows, size.cols, 0);
+        displayed.process(&background.screen().state_formatted());
+        let mut popup = None;
         let mut output = Vec::new();
-        set_scroll_region(
+
+        redraw_popup(
             &mut output,
-            PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
+            background.screen(),
+            &mut popup,
+            Some("[中] nihao"),
+            size,
         )
         .unwrap();
+        displayed.process(&output);
+        assert_ne!(
+            displayed.screen().contents(),
+            background.screen().contents()
+        );
 
-        assert_eq!(output, b"\x1b7\x1b[1;23r\x1b8");
+        output.clear();
+        redraw_popup(&mut output, background.screen(), &mut popup, None, size).unwrap();
+        displayed.process(&output);
+
+        let child_output = b"\x1b[3;1H\r\nupdated";
+        background.process(child_output);
+        displayed.process(child_output);
+        output.clear();
+        redraw_popup(
+            &mut output,
+            background.screen(),
+            &mut popup,
+            Some("[中] hao"),
+            size,
+        )
+        .unwrap();
+        displayed.process(&output);
+
+        output.clear();
+        redraw_popup(&mut output, background.screen(), &mut popup, None, size).unwrap();
+        displayed.process(&output);
+
+        assert_eq!(
+            displayed.screen().contents(),
+            background.screen().contents()
+        );
     }
 }

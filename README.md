@@ -1,6 +1,6 @@
 # rime-fep
 
-基于 Rime 的终端中文输入法前端。`rime-fep` 在 PTY 中运行 shell 或其他命令，并使用终端最后一行显示输入状态和候选词，适用于本地终端和 SSH。
+基于 Rime 的终端中文输入法前端。`rime-fep` 在 PTY 中运行 shell 或其他命令，并在光标附近显示输入状态和候选词，适用于本地终端和 SSH。
 
 ![rime-fep](assets/screenshot.png)
 

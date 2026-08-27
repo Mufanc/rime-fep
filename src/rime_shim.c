@@ -143,21 +143,27 @@ int rime_fep_status(void *pointer, char *buffer, size_t size) {
 
     buffer[0] = '\0';
     append(buffer, size, "[中]");
+    int separated = 0;
     if (context.composition.preedit && context.composition.preedit[0]) {
         append(buffer, size, " %s", context.composition.preedit);
+        if (context.menu.num_candidates > 0) {
+            append(buffer, size, " |");
+            separated = 1;
+        }
     }
     for (int index = 0; index < context.menu.num_candidates; ++index) {
+        const char *spacing = separated && index == 0 ? " " : "  ";
         const char *label = NULL;
         if (context.select_labels) {
             label = context.select_labels[index];
         }
         if (label && label[0]) {
-            append(buffer, size, "  %s.%s", label,
+            append(buffer, size, "%s%s.%s", spacing, label,
                    context.menu.candidates[index].text
                        ? context.menu.candidates[index].text
                        : "");
         } else {
-            append(buffer, size, "  %d.%s", index + 1,
+            append(buffer, size, "%s%d.%s", spacing, index + 1,
                    context.menu.candidates[index].text
                        ? context.menu.candidates[index].text
                        : "");

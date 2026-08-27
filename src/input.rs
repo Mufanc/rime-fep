@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::rime::Rime;
 
@@ -8,10 +9,13 @@ const CONTROL_MASK: i32 = 1 << 2;
 const BACKSPACE: i32 = 0xff08;
 const RETURN: i32 = 0xff0d;
 const ESCAPE: i32 = 0xff1b;
+const F4: i32 = 0xffc1;
+const SWITCH_NOTICE_DURATION: Duration = Duration::from_millis(800);
 
 pub struct InputMethod {
     rime: Rime,
     enabled: bool,
+    notice_until: Option<Instant>,
 }
 
 impl InputMethod {
@@ -19,6 +23,7 @@ impl InputMethod {
         Ok(Self {
             rime: Rime::new(config_dir)?,
             enabled: false,
+            notice_until: None,
         })
     }
 
@@ -26,24 +31,44 @@ impl InputMethod {
         self.route_rime(input)
     }
 
-    pub fn status(&self) -> String {
+    pub fn popup(&self) -> Option<String> {
         if self.enabled {
-            self.rime.status()
+            let status = self.rime.status();
+            if status != "[中]" {
+                return Some(status);
+            }
+        }
+
+        self.notice_until
+            .filter(|until| Instant::now() < *until)
+            .map(|_| if self.enabled { "[中]" } else { "[En]" }.to_owned())
+    }
+
+    pub fn expire_notice(&mut self) -> bool {
+        if self
+            .notice_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.notice_until = None;
+            true
         } else {
-            "[En] rime-fep".to_owned()
+            false
         }
     }
 
     fn route_rime(&mut self, input: &[u8]) -> Vec<u8> {
         if self.enabled
-            && is_kitty_control_grave(input)
-            && self.rime.process(i32::from(b'`'), CONTROL_MASK)
+            && let Some((keycode, modifiers)) = escape_sequence_key(input)
         {
-            return self.rime.take_commit();
+            self.notice_until = None;
+            if self.rime.process(keycode, modifiers) {
+                return self.rime.take_commit();
+            }
         }
 
         // Fixme: Parse CSI sequences across read boundaries instead of assuming one read per sequence.
         if input.first() == Some(&0x1b) && input.len() > 1 {
+            self.notice_until = None;
             return input.to_vec();
         }
 
@@ -52,12 +77,14 @@ impl InputMethod {
         for &byte in input {
             if byte == TOGGLE {
                 self.enabled = !self.enabled;
+                self.notice_until = Some(Instant::now() + SWITCH_NOTICE_DURATION);
                 if !self.enabled {
                     self.rime.clear();
                 }
                 continue;
             }
 
+            self.notice_until = None;
             if !self.enabled {
                 output.push(byte);
                 continue;
@@ -85,22 +112,32 @@ fn rime_key(byte: u8) -> Option<(i32, i32)> {
     }
 }
 
-fn is_kitty_control_grave(input: &[u8]) -> bool {
-    let Some(body) = input
+fn escape_sequence_key(input: &[u8]) -> Option<(i32, i32)> {
+    if matches!(input, b"\x1bOS" | b"\x1b[14~") {
+        return Some((F4, 0));
+    }
+
+    let body = input
         .strip_prefix(b"\x1b[")
-        .and_then(|body| body.strip_suffix(b"u"))
-    else {
-        return false;
-    };
+        .and_then(|body| body.strip_suffix(b"u"))?;
 
     let mut fields = body.split(|byte| *byte == b';');
+    let key = fields.next()?;
+    let modifiers = fields
+        .next()
+        .and_then(|field| field.split(|byte| *byte == b':').next())
+        .unwrap_or(b"1");
 
-    fields.next() == Some(b"96")
-        && fields
-            .next()
-            .and_then(|field| field.split(|byte| *byte == b':').next())
-            == Some(b"5")
-        && fields.next().is_none()
+    if fields.next().is_some() {
+        return None;
+    }
+
+    match (key, modifiers) {
+        (b"27", b"1") => Some((ESCAPE, 0)),
+        (b"96", b"5") => Some((i32::from(b'`'), CONTROL_MASK)),
+        (b"57367", b"1") => Some((F4, 0)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -114,8 +151,15 @@ mod tests {
         assert_eq!(rime_key(b'\r'), Some((RETURN, 0)));
         assert_eq!(rime_key(b'a'), Some((i32::from(b'a'), 0)));
         assert_eq!(rime_key(0x03), None);
-        assert!(is_kitty_control_grave(b"\x1b[96;5u"));
-        assert!(is_kitty_control_grave(b"\x1b[96;5:1u"));
-        assert!(!is_kitty_control_grave(b"\x1b[97;5u"));
+        assert_eq!(escape_sequence_key(b"\x1b[27u"), Some((ESCAPE, 0)));
+        assert_eq!(escape_sequence_key(b"\x1b[96;5u"), Some((96, CONTROL_MASK)));
+        assert_eq!(
+            escape_sequence_key(b"\x1b[96;5:1u"),
+            Some((96, CONTROL_MASK))
+        );
+        assert_eq!(escape_sequence_key(b"\x1b[57367u"), Some((F4, 0)));
+        assert_eq!(escape_sequence_key(b"\x1bOS"), Some((F4, 0)));
+        assert_eq!(escape_sequence_key(b"\x1b[14~"), Some((F4, 0)));
+        assert_eq!(escape_sequence_key(b"\x1b[97;5u"), None);
     }
 }

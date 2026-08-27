@@ -10,6 +10,7 @@ switcher:
   caption: 〔方案選單〕
   hotkeys:
     - Control+grave
+    - F4
   save_options:
     - full_shape
     - ascii_punct
