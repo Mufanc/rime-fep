@@ -32,6 +32,10 @@ const BUILTIN_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../vendor/rime-luna-pinyin/luna_pinyin.schema.yaml"),
     ),
     (
+        "luna_pinyin.custom.yaml",
+        include_bytes!("../assets/luna_pinyin.custom.yaml"),
+    ),
+    (
         "luna_pinyin.dict.yaml",
         include_bytes!("../vendor/rime-luna-pinyin/luna_pinyin.dict.yaml"),
     ),
