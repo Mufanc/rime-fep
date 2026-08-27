@@ -57,8 +57,14 @@ impl InputMethod {
     }
 
     fn route_rime(&mut self, input: &[u8]) -> Vec<u8> {
+        let sequence_key = escape_sequence_key(input);
+        if sequence_key == Some((i32::from(b'\\'), CONTROL_MASK)) {
+            self.toggle();
+            return Vec::new();
+        }
+
         if self.enabled
-            && let Some((keycode, modifiers)) = escape_sequence_key(input)
+            && let Some((keycode, modifiers)) = sequence_key
         {
             self.notice_until = None;
             if self.rime.process(keycode, modifiers) {
@@ -76,11 +82,7 @@ impl InputMethod {
 
         for &byte in input {
             if byte == TOGGLE {
-                self.enabled = !self.enabled;
-                self.notice_until = Some(Instant::now() + SWITCH_NOTICE_DURATION);
-                if !self.enabled {
-                    self.rime.clear();
-                }
+                self.toggle();
                 continue;
             }
 
@@ -97,6 +99,14 @@ impl InputMethod {
             output.extend(self.rime.take_commit());
         }
         output
+    }
+
+    fn toggle(&mut self) {
+        self.enabled = !self.enabled;
+        self.notice_until = Some(Instant::now() + SWITCH_NOTICE_DURATION);
+        if !self.enabled {
+            self.rime.clear();
+        }
     }
 }
 
@@ -134,6 +144,7 @@ fn escape_sequence_key(input: &[u8]) -> Option<(i32, i32)> {
 
     match (key, modifiers) {
         (b"27", b"1") => Some((ESCAPE, 0)),
+        (b"92", b"5") => Some((i32::from(b'\\'), CONTROL_MASK)),
         (b"96", b"5") => Some((i32::from(b'`'), CONTROL_MASK)),
         (b"57367", b"1") => Some((F4, 0)),
         _ => None,
@@ -152,6 +163,10 @@ mod tests {
         assert_eq!(rime_key(b'a'), Some((i32::from(b'a'), 0)));
         assert_eq!(rime_key(0x03), None);
         assert_eq!(escape_sequence_key(b"\x1b[27u"), Some((ESCAPE, 0)));
+        assert_eq!(
+            escape_sequence_key(b"\x1b[92;5u"),
+            Some((i32::from(b'\\'), CONTROL_MASK))
+        );
         assert_eq!(escape_sequence_key(b"\x1b[96;5u"), Some((96, CONTROL_MASK)));
         assert_eq!(
             escape_sequence_key(b"\x1b[96;5:1u"),
