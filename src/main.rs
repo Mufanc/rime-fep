@@ -24,6 +24,8 @@ use vt100::{Parser as VtParser, Screen};
 
 use self::input::InputMethod;
 
+const ACTIVE_ENV: &str = "RIME_FEP_ACTIVE";
+
 enum Event {
     Input(Vec<u8>),
     InputClosed,
@@ -74,6 +76,10 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let (config_dir, command) = arguments()?;
+
+    if env::var_os(ACTIVE_ENV).is_some() {
+        return Err("rime-fep is already running in this terminal session".into());
+    }
 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("stdin and stdout must be terminals".into());
@@ -158,6 +164,7 @@ fn arguments() -> Result<(Option<PathBuf>, CommandBuilder), Box<dyn std::error::
     let mut command = CommandBuilder::new(program);
 
     command.cwd(env::current_dir()?);
+    command.env(ACTIVE_ENV, "1");
     command.args(command_parts);
     Ok((arguments.config_dir, command))
 }
