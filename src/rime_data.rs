@@ -1,13 +1,15 @@
 use std::env;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use blake3::Hasher;
 use directories::BaseDirs;
 use tempfile::TempDir;
 use walkdir::{DirEntry, WalkDir};
+
+const FINGERPRINT_VERSION: &[u8] = b"rime-fep-fingerprint-v1";
 
 const BUILTIN_FILES: &[(&str, &[u8])] = &[
     ("default.yaml", include_bytes!("../assets/default.yaml")),
@@ -109,7 +111,7 @@ pub fn prepare(
 
     lock.lock()?;
 
-    let data_dir = cache_root.join(format!("{fingerprint:016x}"));
+    let data_dir = cache_root.join(fingerprint.to_hex().as_str());
     let shared_data_dir = data_dir.join("source");
     let prebuilt_data_dir = data_dir.join("build");
     let ready_marker = data_dir.join("ready");
@@ -194,27 +196,31 @@ fn fingerprint(
     config_files: &[ConfigFile],
     opencc_data_dir: &Path,
     rime_version: &[u8],
-) -> Result<u64, Box<dyn Error>> {
-    let mut hasher = std::hash::DefaultHasher::new();
+) -> Result<blake3::Hash, Box<dyn Error>> {
+    let mut hasher = Hasher::new();
 
-    rime_version.hash(&mut hasher);
+    hash_bytes(&mut hasher, FINGERPRINT_VERSION);
+    hash_bytes(&mut hasher, rime_version);
 
     for (name, contents) in BUILTIN_FILES {
-        name.hash(&mut hasher);
-        contents.hash(&mut hasher);
+        hash_bytes(&mut hasher, b"builtin");
+        hash_bytes(&mut hasher, name.as_bytes());
+        hash_bytes(&mut hasher, contents);
     }
 
     for name in OPENCC_FILES {
-        name.hash(&mut hasher);
-        fs::read(opencc_data_dir.join(name))?.hash(&mut hasher);
+        hash_bytes(&mut hasher, b"opencc");
+        hash_bytes(&mut hasher, name.as_bytes());
+        hash_bytes(&mut hasher, &fs::read(opencc_data_dir.join(name))?);
     }
 
     for file in config_files {
-        file.relative.hash(&mut hasher);
+        hash_bytes(&mut hasher, b"config");
+        hash_bytes(&mut hasher, file.relative.as_os_str().as_encoded_bytes());
         hash_file(&file.source, &mut hasher)?;
     }
 
-    Ok(hasher.finish())
+    Ok(hasher.finalize())
 }
 
 fn write_sources(
@@ -258,16 +264,23 @@ fn copy_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn hash_file(path: &Path, hasher: &mut impl Hasher) -> io::Result<()> {
+fn hash_bytes(hasher: &mut Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_file(path: &Path, hasher: &mut Hasher) -> io::Result<()> {
     let mut file = File::open(path)?;
     let mut buffer = [0; 64 * 1024];
+
+    hasher.update(&file.metadata()?.len().to_le_bytes());
 
     loop {
         let length = file.read(&mut buffer)?;
         if length == 0 {
             return Ok(());
         }
-        hasher.write(&buffer[..length]);
+        hasher.update(&buffer[..length]);
     }
 }
 
@@ -318,6 +331,19 @@ fn require_opencc_data(path: PathBuf, variable: &str) -> Result<PathBuf, Box<dyn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_fields_are_framed() {
+        let mut left = Hasher::new();
+        hash_bytes(&mut left, b"a");
+        hash_bytes(&mut left, b"bc");
+
+        let mut right = Hasher::new();
+        hash_bytes(&mut right, b"ab");
+        hash_bytes(&mut right, b"c");
+
+        assert_ne!(left.finalize(), right.finalize());
+    }
 
     #[test]
     fn ignores_generated_user_data() {
