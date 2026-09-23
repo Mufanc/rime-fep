@@ -10,10 +10,12 @@ crossterm = { version = "0.29", default-features = false }
 directories = "6"
 portable-pty = "0.9"
 signal-hook = "0.4"
-tempfile = "3"
 unicode-width = "0.2"
 vt100 = "0.16"
 walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 cc = "1"

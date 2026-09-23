@@ -1,4 +1,5 @@
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +8,6 @@
 
 typedef struct {
     RimeApi *api;
-    RimeSessionId session;
     char *shared_data_dir;
     char *user_data_dir;
     char *prebuilt_data_dir;
@@ -91,16 +91,6 @@ void *rime_fep_create(const char *shared_data_dir, const char *user_data_dir,
         rime->api->join_maintenance_thread();
     }
 
-    rime->session = rime->api->create_session();
-    if (!rime->session) {
-        rime->api->finalize();
-        free(rime->shared_data_dir);
-        free(rime->user_data_dir);
-        free(rime->prebuilt_data_dir);
-        free(rime);
-        return NULL;
-    }
-    rime->api->set_option(rime->session, "ascii_mode", False);
     return rime;
 }
 
@@ -109,7 +99,8 @@ void rime_fep_destroy(void *pointer) {
     if (!rime) {
         return;
     }
-    rime->api->destroy_session(rime->session);
+    rime->api->cleanup_all_sessions();
+    rime->api->sync_user_data();
     rime->api->finalize();
     free(rime->shared_data_dir);
     free(rime->user_data_dir);
@@ -117,15 +108,31 @@ void rime_fep_destroy(void *pointer) {
     free(rime);
 }
 
-int rime_fep_process(void *pointer, int keycode, int modifiers) {
+uintptr_t rime_fep_create_session(void *pointer) {
     RimeFep *rime = pointer;
-    return rime->api->process_key(rime->session, keycode, modifiers);
+    RimeSessionId session = rime->api->create_session();
+    if (session) {
+        rime->api->set_option(session, "ascii_mode", False);
+    }
+    return session;
 }
 
-int rime_fep_take_commit(void *pointer, char *buffer, size_t size) {
+void rime_fep_destroy_session(void *pointer, uintptr_t session) {
+    RimeFep *rime = pointer;
+    rime->api->destroy_session(session);
+}
+
+int rime_fep_process(void *pointer, uintptr_t session, int keycode,
+                     int modifiers) {
+    RimeFep *rime = pointer;
+    return rime->api->process_key(session, keycode, modifiers);
+}
+
+int rime_fep_take_commit(void *pointer, uintptr_t session, char *buffer,
+                         size_t size) {
     RimeFep *rime = pointer;
     RIME_STRUCT(RimeCommit, commit);
-    if (!size || !rime->api->get_commit(rime->session, &commit)) {
+    if (!size || !rime->api->get_commit(session, &commit)) {
         return 0;
     }
 
@@ -134,10 +141,11 @@ int rime_fep_take_commit(void *pointer, char *buffer, size_t size) {
     return 1;
 }
 
-int rime_fep_status(void *pointer, char *buffer, size_t size) {
+int rime_fep_status(void *pointer, uintptr_t session, char *buffer,
+                    size_t size) {
     RimeFep *rime = pointer;
     RIME_STRUCT(RimeContext, context);
-    if (!size || !rime->api->get_context(rime->session, &context)) {
+    if (!size || !rime->api->get_context(session, &context)) {
         return 0;
     }
 
@@ -174,7 +182,7 @@ int rime_fep_status(void *pointer, char *buffer, size_t size) {
     return 1;
 }
 
-void rime_fep_clear(void *pointer) {
+void rime_fep_clear(void *pointer, uintptr_t session) {
     RimeFep *rime = pointer;
-    rime->api->clear_composition(rime->session);
+    rime->api->clear_composition(session);
 }

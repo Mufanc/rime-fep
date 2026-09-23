@@ -1,4 +1,5 @@
 mod input;
+mod ipc;
 mod rime;
 mod rime_data;
 
@@ -47,6 +48,8 @@ struct Popup {
 struct Arguments {
     #[arg(long)]
     config_dir: Option<PathBuf>,
+    #[arg(long, hide = true, value_name = "FINGERPRINT")]
+    server: Option<String>,
     #[arg(allow_hyphen_values = true)]
     command: Vec<OsString>,
 }
@@ -65,17 +68,20 @@ impl Drop for RawMode {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(status) => ExitCode::from(status.exit_code().min(u8::MAX as u32) as u8),
-        Err(error) => {
-            eprintln!("rime-fep: {error}");
-            ExitCode::FAILURE
-        }
-    }
+    run().unwrap_or_else(|error| {
+        eprintln!("rime-fep: {error}");
+        ExitCode::FAILURE
+    })
 }
 
-fn run() -> Result<ExitStatus, Box<dyn std::error::Error>> {
-    let (config_dir, command) = arguments()?;
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let arguments = Arguments::parse();
+    if let Some(fingerprint) = arguments.server.as_deref() {
+        ipc::serve(arguments.config_dir.as_deref(), fingerprint)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let config_dir = arguments.config_dir.clone();
+    let command = command(arguments)?;
 
     if env::var_os(ACTIVE_ENV).is_some() {
         return Err("rime-fep is already running in this terminal session".into());
@@ -98,7 +104,8 @@ fn run() -> Result<ExitStatus, Box<dyn std::error::Error>> {
     if result.is_err() {
         let _ = child.kill();
     }
-    result
+
+    result.map(|status| ExitCode::from(status.exit_code().min(u8::MAX as u32) as u8))
 }
 
 fn run_proxy(
@@ -153,8 +160,7 @@ fn run_proxy(
     }
 }
 
-fn arguments() -> Result<(Option<PathBuf>, CommandBuilder), Box<dyn std::error::Error>> {
-    let arguments = Arguments::parse();
+fn command(arguments: Arguments) -> Result<CommandBuilder, Box<dyn std::error::Error>> {
     let mut command_parts = arguments.command;
     let program = if command_parts.is_empty() {
         env::var_os("SHELL").ok_or("SHELL is not set and no command was provided")?
@@ -166,7 +172,8 @@ fn arguments() -> Result<(Option<PathBuf>, CommandBuilder), Box<dyn std::error::
     command.cwd(env::current_dir()?);
     command.env(ACTIVE_ENV, "1");
     command.args(command_parts);
-    Ok((arguments.config_dir, command))
+
+    Ok(command)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -190,10 +197,11 @@ fn proxy_loop(
         match receiver.recv_timeout(Duration::from_millis(16)) {
             Ok(Event::Input(bytes)) => {
                 if let Some(writer) = pty_writer {
-                    writer.write_all(&input_method.route(&bytes))?;
+                    writer.write_all(&input_method.route(&bytes)?)?;
                     writer.flush()?;
                 }
-                let text = input_method.popup();
+                let text = input_method.popup()?;
+
                 redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
                 popup_dirty = false;
                 last_draw = Instant::now();
@@ -218,7 +226,7 @@ fn proxy_loop(
                 parser.screen_mut().set_size(size.rows, size.cols);
                 stdout.write_all(&parser.screen().state_formatted())?;
                 stdout.flush()?;
-                let text = input_method.popup();
+                let text = input_method.popup()?;
                 redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
                 popup_dirty = false;
                 last_draw = Instant::now();
@@ -228,14 +236,14 @@ fn proxy_loop(
         }
 
         if input_method.expire_notice() {
-            let text = input_method.popup();
+            let text = input_method.popup()?;
             redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
             popup_dirty = false;
             last_draw = Instant::now();
         }
 
         if popup_dirty && last_draw.elapsed() >= Duration::from_millis(16) {
-            let text = input_method.popup();
+            let text = input_method.popup()?;
             redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
             popup_dirty = false;
             last_draw = Instant::now();
@@ -289,8 +297,8 @@ fn terminal_size() -> io::Result<PtySize> {
     let size = terminal::window_size()?;
 
     Ok(PtySize {
-        rows: size.rows,
-        cols: size.columns,
+        rows: size.rows.max(1),
+        cols: size.columns.max(1),
         pixel_width: size.width,
         pixel_height: size.height,
     })

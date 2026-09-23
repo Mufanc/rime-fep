@@ -1,8 +1,9 @@
 use std::error::Error;
+use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::rime::Rime;
+use crate::ipc::RimeClient;
 
 const TOGGLE: u8 = 0x1c;
 const CONTROL_MASK: i32 = 1 << 2;
@@ -13,7 +14,7 @@ const F4: i32 = 0xffc1;
 const SWITCH_NOTICE_DURATION: Duration = Duration::from_millis(800);
 
 pub struct InputMethod {
-    rime: Rime,
+    rime: RimeClient,
     enabled: bool,
     notice_until: Option<Instant>,
 }
@@ -21,27 +22,28 @@ pub struct InputMethod {
 impl InputMethod {
     pub fn new(config_dir: Option<&Path>) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            rime: Rime::new(config_dir)?,
+            rime: RimeClient::connect(config_dir)?,
             enabled: false,
             notice_until: None,
         })
     }
 
-    pub fn route(&mut self, input: &[u8]) -> Vec<u8> {
+    pub fn route(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
         self.route_rime(input)
     }
 
-    pub fn popup(&self) -> Option<String> {
+    pub fn popup(&mut self) -> io::Result<Option<String>> {
         if self.enabled {
-            let status = self.rime.status();
+            let status = self.rime.status()?;
             if status != "[中]" {
-                return Some(status);
+                return Ok(Some(status));
             }
         }
 
-        self.notice_until
+        Ok(self
+            .notice_until
             .filter(|until| Instant::now() < *until)
-            .map(|_| if self.enabled { "[中]" } else { "[En]" }.to_owned())
+            .map(|_| if self.enabled { "[中]" } else { "[En]" }.to_owned()))
     }
 
     pub fn expire_notice(&mut self) -> bool {
@@ -56,33 +58,33 @@ impl InputMethod {
         }
     }
 
-    fn route_rime(&mut self, input: &[u8]) -> Vec<u8> {
+    fn route_rime(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
         let sequence_key = escape_sequence_key(input);
         if sequence_key == Some((i32::from(b'\\'), CONTROL_MASK)) {
-            self.toggle();
-            return Vec::new();
+            self.toggle()?;
+            return Ok(Vec::new());
         }
 
         if self.enabled
             && let Some((keycode, modifiers)) = sequence_key
         {
             self.notice_until = None;
-            if self.rime.process(keycode, modifiers) {
-                return self.rime.take_commit();
+            if self.rime.process(keycode, modifiers)? {
+                return Ok(self.rime.take_commit());
             }
         }
 
         // Fixme: Parse CSI sequences across read boundaries instead of assuming one read per sequence.
         if input.first() == Some(&0x1b) && input.len() > 1 {
             self.notice_until = None;
-            return input.to_vec();
+            return Ok(input.to_vec());
         }
 
         let mut output = Vec::new();
 
         for &byte in input {
             if byte == TOGGLE {
-                self.toggle();
+                self.toggle()?;
                 continue;
             }
 
@@ -93,20 +95,24 @@ impl InputMethod {
             }
 
             match rime_key(byte) {
-                Some((keycode, modifiers)) if self.rime.process(keycode, modifiers) => {}
+                Some((keycode, modifiers)) if self.rime.process(keycode, modifiers)? => {}
                 _ => output.push(byte),
             }
             output.extend(self.rime.take_commit());
         }
-        output
+
+        Ok(output)
     }
 
-    fn toggle(&mut self) {
+    fn toggle(&mut self) -> io::Result<()> {
         self.enabled = !self.enabled;
         self.notice_until = Some(Instant::now() + SWITCH_NOTICE_DURATION);
+
         if !self.enabled {
-            self.rime.clear();
+            self.rime.clear()?;
         }
+
+        Ok(())
     }
 }
 

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
 use directories::BaseDirs;
-use tempfile::TempDir;
 use walkdir::{DirEntry, WalkDir};
 
 const FINGERPRINT_VERSION: &[u8] = b"rime-fep-fingerprint-v1";
@@ -66,16 +65,17 @@ const OPENCC_FILES: &[&str] = &[
 ];
 
 pub struct PreparedData {
+    pub fingerprint: String,
     pub shared_data_dir: PathBuf,
     pub prebuilt_data_dir: PathBuf,
-    pub user_data_dir: TempDir,
+    pub user_data_dir: PathBuf,
     pub deploy: bool,
     ready_marker: PathBuf,
     _lock: File,
 }
 
 impl PreparedData {
-    pub fn finish(self) -> Result<TempDir, Box<dyn Error>> {
+    pub fn finish(self) -> Result<PathBuf, Box<dyn Error>> {
         if self.deploy {
             if !self.prebuilt_data_dir.join("default.yaml").is_file() {
                 return Err("Rime did not compile the built-in schema".into());
@@ -97,7 +97,9 @@ pub fn prepare(
         .transpose()?
         .unwrap_or_default();
     let opencc_data_dir = opencc_data_dir(config_dir.as_deref())?;
-    let fingerprint = fingerprint(&config_files, &opencc_data_dir, rime_version)?;
+    let fingerprint = calculate_fingerprint(&config_files, &opencc_data_dir, rime_version)?
+        .to_hex()
+        .to_string();
     let cache_root = cache_root()?;
 
     fs::create_dir_all(&cache_root)?;
@@ -111,7 +113,7 @@ pub fn prepare(
 
     lock.lock()?;
 
-    let data_dir = cache_root.join(fingerprint.to_hex().as_str());
+    let data_dir = cache_root.join(&fingerprint);
     let shared_data_dir = data_dir.join("source");
     let prebuilt_data_dir = data_dir.join("build");
     let ready_marker = data_dir.join("ready");
@@ -122,7 +124,8 @@ pub fn prepare(
         fs::create_dir_all(&prebuilt_data_dir)?;
     }
 
-    let user_data_dir = tempfile::Builder::new().prefix("rime-fep-").tempdir()?;
+    let user_data_dir = data_root()?.join("user").join(&fingerprint);
+    fs::create_dir_all(&user_data_dir)?;
 
     for file in &config_files {
         if file.relative.parent().is_none()
@@ -131,11 +134,12 @@ pub fn prepare(
                 .file_name()
                 .is_some_and(|name| name.as_encoded_bytes().ends_with(b".custom.yaml"))
         {
-            fs::copy(&file.source, user_data_dir.path().join(&file.relative))?;
+            fs::copy(&file.source, user_data_dir.join(&file.relative))?;
         }
     }
 
     Ok(PreparedData {
+        fingerprint,
         shared_data_dir,
         prebuilt_data_dir,
         user_data_dir,
@@ -143,6 +147,29 @@ pub fn prepare(
         ready_marker,
         _lock: lock,
     })
+}
+
+pub fn fingerprint(
+    config_dir: Option<&Path>,
+    rime_version: &[u8],
+) -> Result<String, Box<dyn Error>> {
+    let config_dir = config_dir.map(fs::canonicalize).transpose()?;
+    let config_files = config_dir
+        .as_deref()
+        .map(collect_config_files)
+        .transpose()?
+        .unwrap_or_default();
+    let opencc_data_dir = opencc_data_dir(config_dir.as_deref())?;
+
+    Ok(
+        calculate_fingerprint(&config_files, &opencc_data_dir, rime_version)?
+            .to_hex()
+            .to_string(),
+    )
+}
+
+pub fn runtime_dir() -> Result<PathBuf, Box<dyn Error>> {
+    Ok(cache_root()?.join("run"))
 }
 
 struct ConfigFile {
@@ -192,7 +219,7 @@ fn keep_entry(entry: &DirEntry) -> bool {
         || !matches!(entry.file_name().to_str(), Some(".git" | "build" | "sync"))
 }
 
-fn fingerprint(
+fn calculate_fingerprint(
     config_files: &[ConfigFile],
     opencc_data_dir: &Path,
     rime_version: &[u8],
@@ -292,6 +319,17 @@ fn cache_root() -> Result<PathBuf, Box<dyn Error>> {
     Ok(BaseDirs::new()
         .ok_or("cannot determine the cache directory")?
         .cache_dir()
+        .join("rime-fep"))
+}
+
+fn data_root() -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = env::var_os("RIME_FEP_DATA_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+
+    Ok(BaseDirs::new()
+        .ok_or("cannot determine the data directory")?
+        .data_dir()
         .join("rime-fep"))
 }
 
