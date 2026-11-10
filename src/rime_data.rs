@@ -6,53 +6,13 @@ use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
 use directories::BaseDirs;
+use flate2::read::GzDecoder;
 use walkdir::{DirEntry, WalkDir};
 
 const FINGERPRINT_VERSION: &[u8] = b"rime-fep-fingerprint-v1";
 
-const BUILTIN_FILES: &[(&str, &[u8])] = &[
-    ("default.yaml", include_bytes!("../assets/default.yaml")),
-    (
-        "key_bindings.yaml",
-        include_bytes!("../vendor/rime-prelude/key_bindings.yaml"),
-    ),
-    (
-        "punctuation.yaml",
-        include_bytes!("../vendor/rime-prelude/punctuation.yaml"),
-    ),
-    (
-        "symbols.yaml",
-        include_bytes!("../vendor/rime-prelude/symbols.yaml"),
-    ),
-    (
-        "pinyin.yaml",
-        include_bytes!("../vendor/rime-luna-pinyin/pinyin.yaml"),
-    ),
-    (
-        "luna_pinyin.schema.yaml",
-        include_bytes!("../vendor/rime-luna-pinyin/luna_pinyin.schema.yaml"),
-    ),
-    (
-        "luna_pinyin.custom.yaml",
-        include_bytes!("../assets/luna_pinyin.custom.yaml"),
-    ),
-    (
-        "luna_pinyin.dict.yaml",
-        include_bytes!("../vendor/rime-luna-pinyin/luna_pinyin.dict.yaml"),
-    ),
-    (
-        "stroke.schema.yaml",
-        include_bytes!("../vendor/rime-stroke/stroke.schema.yaml"),
-    ),
-    (
-        "stroke.dict.yaml",
-        include_bytes!("../vendor/rime-stroke/stroke.dict.yaml"),
-    ),
-    (
-        "essay.txt",
-        include_bytes!("../vendor/rime-essay/essay.txt"),
-    ),
-];
+const BUILTIN_FILES: &[(&str, &[u8], u64)] =
+    include!(concat!(env!("OUT_DIR"), "/builtin_files.rs"));
 
 const OPENCC_FILES: &[&str] = &[
     "t2s.json",
@@ -229,10 +189,10 @@ fn calculate_fingerprint(
     hash_bytes(&mut hasher, FINGERPRINT_VERSION);
     hash_bytes(&mut hasher, rime_version);
 
-    for (name, contents) in BUILTIN_FILES {
+    for &(name, contents, length) in BUILTIN_FILES {
         hash_bytes(&mut hasher, b"builtin");
         hash_bytes(&mut hasher, name.as_bytes());
-        hash_bytes(&mut hasher, contents);
+        hash_reader(GzDecoder::new(contents), length, &mut hasher)?;
     }
 
     for name in OPENCC_FILES {
@@ -255,8 +215,11 @@ fn write_sources(
     opencc_data_dir: &Path,
     config_files: &[ConfigFile],
 ) -> Result<(), Box<dyn Error>> {
-    for (relative, contents) in BUILTIN_FILES {
-        write_file(&shared_data_dir.join(relative), contents)?;
+    fs::create_dir_all(shared_data_dir)?;
+
+    for &(relative, contents, _) in BUILTIN_FILES {
+        let mut file = File::create(shared_data_dir.join(relative))?;
+        io::copy(&mut GzDecoder::new(contents), &mut file)?;
     }
 
     for name in OPENCC_FILES {
@@ -297,18 +260,15 @@ fn hash_bytes(hasher: &mut Hasher, bytes: &[u8]) {
 }
 
 fn hash_file(path: &Path, hasher: &mut Hasher) -> io::Result<()> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0; 64 * 1024];
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    hash_reader(file, length, hasher)
+}
 
-    hasher.update(&file.metadata()?.len().to_le_bytes());
-
-    loop {
-        let length = file.read(&mut buffer)?;
-        if length == 0 {
-            return Ok(());
-        }
-        hasher.update(&buffer[..length]);
-    }
+fn hash_reader(mut reader: impl Read, length: u64, hasher: &mut Hasher) -> io::Result<()> {
+    hasher.update(&length.to_le_bytes());
+    io::copy(&mut reader, hasher)?;
+    Ok(())
 }
 
 fn cache_root() -> Result<PathBuf, Box<dyn Error>> {
@@ -381,6 +341,24 @@ mod tests {
         hash_bytes(&mut right, b"c");
 
         assert_ne!(left.finalize(), right.finalize());
+    }
+
+    #[test]
+    fn hashes_builtin_data_as_original_bytes() {
+        let &(_, contents, length) = BUILTIN_FILES
+            .iter()
+            .find(|(name, _, _)| *name == "essay.txt")
+            .unwrap();
+        let mut original = Hasher::new();
+        hash_bytes(
+            &mut original,
+            include_bytes!("../vendor/rime-essay/essay.txt"),
+        );
+
+        let mut compressed = Hasher::new();
+        hash_reader(GzDecoder::new(contents), length, &mut compressed).unwrap();
+
+        assert_eq!(compressed.finalize(), original.finalize());
     }
 
     #[test]
