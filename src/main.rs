@@ -134,7 +134,7 @@ fn run_proxy(
     spawn_resize_listener(sender)?;
 
     let mut stdout = io::stdout().lock();
-    let mut parser = VtParser::new(size.rows, size.cols, 0);
+    let mut parser = VtParser::new(size.rows.try_into()?, size.cols.try_into()?, 0);
     let mut popup = None;
 
     let result = proxy_loop(
@@ -223,10 +223,12 @@ fn proxy_loop(
                 popup.take();
                 *size = terminal_size()?;
                 master.resize(*size)?;
-                parser.screen_mut().set_size(size.rows, size.cols);
-                stdout.write_all(&parser.screen().state_formatted())?;
+                parser.set_size(size.rows.try_into()?, size.cols.try_into()?);
+                stdout.write_all(parser.screen().state_formatted().as_bytes())?;
                 stdout.flush()?;
+
                 let text = input_method.popup()?;
+
                 redraw_popup(stdout, parser.screen(), popup, text.as_deref(), *size)?;
                 popup_dirty = false;
                 last_draw = Instant::now();
@@ -334,15 +336,15 @@ fn redraw_popup(
         *popup = Some(new_popup);
     }
 
-    stdout.write_all(&screen.cursor_state_formatted())?;
-    stdout.write_all(&screen.attributes_formatted())?;
+    stdout.write_all(screen.cursor_state_formatted().as_bytes())?;
+    stdout.write_all(screen.attributes_formatted().as_bytes())?;
     stdout.flush()
 }
 
 fn restore_popup(stdout: &mut impl Write, screen: &Screen, popup: Popup) -> io::Result<()> {
     let (_, columns) = screen.size();
     let Some(row) = screen
-        .rows_formatted(0, columns)
+        .rows_formatted(0, columns.get())
         .nth(usize::from(popup.row))
     else {
         return Ok(());
@@ -354,7 +356,7 @@ fn restore_popup(stdout: &mut impl Write, screen: &Screen, popup: Popup) -> io::
         SetAttribute(Attribute::Reset),
         Clear(ClearType::CurrentLine)
     )?;
-    stdout.write_all(&row)
+    stdout.write_all(row.as_bytes())
 }
 
 fn popup_content(screen: &Screen, size: PtySize, text: &str) -> Option<(Popup, String)> {
@@ -405,7 +407,11 @@ mod tests {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let mut parser = VtParser::new(size.rows, size.cols, 0);
+        let mut parser = VtParser::new(
+            size.rows.try_into().unwrap(),
+            size.cols.try_into().unwrap(),
+            0,
+        );
 
         assert_eq!(
             popup_content(parser.screen(), size, "[中] a")
@@ -437,10 +443,12 @@ mod tests {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let mut background = VtParser::new(size.rows, size.cols, 0);
+        let rows = size.rows.try_into().unwrap();
+        let cols = size.cols.try_into().unwrap();
+        let mut background = VtParser::new(rows, cols, 0);
         background.process(b"first\r\nsecond\r\nthird");
-        let mut displayed = VtParser::new(size.rows, size.cols, 0);
-        displayed.process(&background.screen().state_formatted());
+        let mut displayed = VtParser::new(rows, cols, 0);
+        displayed.process(background.screen().state_formatted().as_bytes());
         let mut popup = None;
         let mut output = Vec::new();
 
