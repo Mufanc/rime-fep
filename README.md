@@ -6,6 +6,8 @@
 
 ## 构建
 
+### 本机构建
+
 需要 Rust、C 编译器，以及 librime 和 OpenCC。macOS 可通过 Homebrew 安装运行库：
 
 ```sh
@@ -15,6 +17,21 @@ cargo build --release
 ```
 
 librime 位于非标准路径时，可设置 `RIME_INCLUDE_DIR` 和 `RIME_LIB_DIR`。
+
+### Linux x86_64 全静态构建
+
+需要 `cross` 和可运行 `linux/amd64` 容器的 Docker 引擎。在项目根目录执行：
+
+```sh
+# macOS 上先准备 Linux Rust 工具链
+rustup toolchain install stable-x86_64-unknown-linux-gnu \
+  --profile minimal --force-non-host --target x86_64-unknown-linux-musl
+
+git submodule update --init --recursive
+cross build --release --target x86_64-unknown-linux-musl
+```
+
+产物为 `target/x86_64-unknown-linux-musl/release/rime-fep`，可直接复制到 x86_64 Linux 运行。
 
 ## 使用
 
@@ -47,3 +64,4 @@ target/release/rime-fep --config-dir ~/.config/rime
 ## 限制
 
 - 在传统终端协议下，`Ctrl+Space`、`Ctrl+@` 和 `` Ctrl+` `` 无法区分。
+- 全静态 Linux 版本不支持外部动态插件。

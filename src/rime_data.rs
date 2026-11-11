@@ -14,15 +14,8 @@ const FINGERPRINT_VERSION: &[u8] = b"rime-fep-fingerprint-v1";
 const BUILTIN_FILES: &[(&str, &[u8], u64)] =
     include!(concat!(env!("OUT_DIR"), "/builtin_files.rs"));
 
-const OPENCC_FILES: &[&str] = &[
-    "t2s.json",
-    "TSCharacters.ocd2",
-    "TSPhrases.ocd2",
-    "t2hk.json",
-    "HKVariants.ocd2",
-    "t2tw.json",
-    "TWVariants.ocd2",
-];
+const OPENCC_FILES: &[(&str, Option<&[u8]>)] =
+    include!(concat!(env!("OUT_DIR"), "/opencc_files.rs"));
 
 pub struct PreparedData {
     pub fingerprint: String,
@@ -57,9 +50,10 @@ pub fn prepare(
         .transpose()?
         .unwrap_or_default();
     let opencc_data_dir = opencc_data_dir(config_dir.as_deref())?;
-    let fingerprint = calculate_fingerprint(&config_files, &opencc_data_dir, rime_version)?
-        .to_hex()
-        .to_string();
+    let fingerprint =
+        calculate_fingerprint(&config_files, opencc_data_dir.as_deref(), rime_version)?
+            .to_hex()
+            .to_string();
     let cache_root = cache_root()?;
 
     fs::create_dir_all(&cache_root)?;
@@ -80,7 +74,7 @@ pub fn prepare(
     let deploy = !ready_marker.is_file() || !prebuilt_data_dir.join("default.yaml").is_file();
 
     if deploy {
-        write_sources(&shared_data_dir, &opencc_data_dir, &config_files)?;
+        write_sources(&shared_data_dir, opencc_data_dir.as_deref(), &config_files)?;
         fs::create_dir_all(&prebuilt_data_dir)?;
     }
 
@@ -122,7 +116,7 @@ pub fn fingerprint(
     let opencc_data_dir = opencc_data_dir(config_dir.as_deref())?;
 
     Ok(
-        calculate_fingerprint(&config_files, &opencc_data_dir, rime_version)?
+        calculate_fingerprint(&config_files, opencc_data_dir.as_deref(), rime_version)?
             .to_hex()
             .to_string(),
     )
@@ -181,7 +175,7 @@ fn keep_entry(entry: &DirEntry) -> bool {
 
 fn calculate_fingerprint(
     config_files: &[ConfigFile],
-    opencc_data_dir: &Path,
+    opencc_data_dir: Option<&Path>,
     rime_version: &[u8],
 ) -> Result<blake3::Hash, Box<dyn Error>> {
     let mut hasher = Hasher::new();
@@ -195,10 +189,13 @@ fn calculate_fingerprint(
         hash_reader(GzDecoder::new(contents), length, &mut hasher)?;
     }
 
-    for name in OPENCC_FILES {
+    for &(name, embedded) in OPENCC_FILES {
         hash_bytes(&mut hasher, b"opencc");
         hash_bytes(&mut hasher, name.as_bytes());
-        hash_bytes(&mut hasher, &fs::read(opencc_data_dir.join(name))?);
+        hash_bytes(
+            &mut hasher,
+            &load_opencc_file(opencc_data_dir, name, embedded)?,
+        );
     }
 
     for file in config_files {
@@ -212,7 +209,7 @@ fn calculate_fingerprint(
 
 fn write_sources(
     shared_data_dir: &Path,
-    opencc_data_dir: &Path,
+    opencc_data_dir: Option<&Path>,
     config_files: &[ConfigFile],
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(shared_data_dir)?;
@@ -222,10 +219,10 @@ fn write_sources(
         io::copy(&mut GzDecoder::new(contents), &mut file)?;
     }
 
-    for name in OPENCC_FILES {
+    for &(name, embedded) in OPENCC_FILES {
         write_file(
             &shared_data_dir.join("opencc").join(name),
-            &fs::read(opencc_data_dir.join(name))?,
+            &load_opencc_file(opencc_data_dir, name, embedded)?,
         )?;
     }
 
@@ -293,9 +290,9 @@ fn data_root() -> Result<PathBuf, Box<dyn Error>> {
         .join("rime-fep"))
 }
 
-fn opencc_data_dir(config_dir: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
+fn opencc_data_dir(config_dir: Option<&Path>) -> Result<Option<PathBuf>, Box<dyn Error>> {
     if let Some(path) = env::var_os("RIME_OPENCC_DATA_DIR") {
-        return require_opencc_data(PathBuf::from(path), "RIME_OPENCC_DATA_DIR");
+        return require_opencc_data(PathBuf::from(path), "RIME_OPENCC_DATA_DIR").map(Some);
     }
 
     let mut candidates = Vec::new();
@@ -312,22 +309,57 @@ fn opencc_data_dir(config_dir: Option<&Path>) -> Result<PathBuf, Box<dyn Error>>
         PathBuf::from("/usr/share/opencc"),
     ]);
 
-    candidates
-        .into_iter()
-        .find(|path| OPENCC_FILES.iter().all(|name| path.join(name).is_file()))
-        .ok_or_else(|| "cannot find OpenCC data; set RIME_OPENCC_DATA_DIR".into())
+    let data_dir = candidates.into_iter().find(|path| {
+        OPENCC_FILES
+            .iter()
+            .all(|(name, _)| path.join(name).is_file())
+    });
+
+    if data_dir.is_some() || OPENCC_FILES.iter().all(|(_, contents)| contents.is_some()) {
+        return Ok(data_dir);
+    }
+
+    Err("cannot find OpenCC data; set RIME_OPENCC_DATA_DIR".into())
 }
 
 fn require_opencc_data(path: PathBuf, variable: &str) -> Result<PathBuf, Box<dyn Error>> {
-    if OPENCC_FILES.iter().all(|name| path.join(name).is_file()) {
+    if OPENCC_FILES
+        .iter()
+        .all(|(name, _)| path.join(name).is_file())
+    {
         Ok(path)
     } else {
         Err(format!("{variable} does not contain the required OpenCC data").into())
     }
 }
 
+fn load_opencc_file(
+    directory: Option<&Path>,
+    name: &str,
+    embedded: Option<&[u8]>,
+) -> io::Result<Vec<u8>> {
+    if let Some(directory) = directory {
+        return fs::read(directory.join(name));
+    }
+
+    let contents = embedded.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing OpenCC data: {name}"),
+        )
+    })?;
+    let mut decoded = Vec::new();
+
+    GzDecoder::new(contents).read_to_end(&mut decoded)?;
+
+    Ok(decoded)
+}
+
 #[cfg(test)]
 mod tests {
+    use flate2::Compression;
+    use flate2::read::GzEncoder;
+
     use super::*;
 
     #[test]
@@ -359,6 +391,52 @@ mod tests {
         hash_reader(GzDecoder::new(contents), length, &mut compressed).unwrap();
 
         assert_eq!(compressed.finalize(), original.finalize());
+    }
+
+    #[test]
+    fn opencc_directory_overrides_embedded_data() {
+        let mut encoder = GzEncoder::new(&b"builtin"[..], Compression::fast());
+        let mut embedded = Vec::new();
+        encoder.read_to_end(&mut embedded).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("t2s.json"), b"custom").unwrap();
+
+        assert_eq!(
+            load_opencc_file(Some(directory.path()), "t2s.json", Some(&embedded)).unwrap(),
+            b"custom"
+        );
+        assert_eq!(
+            load_opencc_file(None, "t2s.json", Some(&embedded)).unwrap(),
+            b"builtin"
+        );
+        assert!(load_opencc_file(Some(directory.path()), "missing.json", Some(&embedded)).is_err());
+        assert!(load_opencc_file(None, "t2s.json", None).is_err());
+        assert!(load_opencc_file(None, "t2s.json", Some(b"invalid gzip")).is_err());
+    }
+
+    #[cfg(target_env = "musl")]
+    #[test]
+    fn embedded_opencc_matches_external_fingerprint_and_deployment() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+
+        for &(name, contents) in OPENCC_FILES {
+            let decoded = load_opencc_file(None, name, contents).unwrap();
+            fs::write(directory.path().join(name), decoded).unwrap();
+        }
+
+        assert_eq!(
+            calculate_fingerprint(&[], None, b"test").unwrap(),
+            calculate_fingerprint(&[], Some(directory.path()), b"test").unwrap()
+        );
+        write_sources(source.path(), None, &[]).unwrap();
+
+        for &(name, _) in OPENCC_FILES {
+            assert_eq!(
+                fs::read(source.path().join("opencc").join(name)).unwrap(),
+                fs::read(directory.path().join(name)).unwrap()
+            );
+        }
     }
 
     #[test]

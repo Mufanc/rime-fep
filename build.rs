@@ -21,9 +21,22 @@ const BUILTIN_FILES: &[&str] = &[
     "vendor/rime-essay/essay.txt",
 ];
 
+const OPENCC_FILES: &[&str] = &[
+    "t2s.json",
+    "TSCharacters.ocd2",
+    "TSPhrases.ocd2",
+    "t2hk.json",
+    "HKVariants.ocd2",
+    "t2tw.json",
+    "TWVariants.ocd2",
+];
+
 fn main() -> io::Result<()> {
     println!("cargo:rerun-if-env-changed=RIME_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=RIME_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=RIME_OPENCC_DATA_DIR");
+
+    let static_link = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl");
 
     let include_dir = find_directory(
         "RIME_INCLUDE_DIR",
@@ -34,16 +47,18 @@ fn main() -> io::Result<()> {
         ],
         "rime_api.h",
     );
+
     cc::Build::new()
         .file("src/rime_shim.c")
         .include(include_dir)
         .warnings(true)
         .compile("rime_fep_rime");
 
-    link_system_rime();
+    link_system_rime(static_link);
     println!("cargo:rerun-if-changed=src/rime_shim.c");
+    compress_builtin_files()?;
 
-    compress_builtin_files()
+    embed_opencc_files(static_link)
 }
 
 fn compress_builtin_files() -> io::Result<()> {
@@ -55,30 +70,82 @@ fn compress_builtin_files() -> io::Result<()> {
     for &source in BUILTIN_FILES {
         println!("cargo:rerun-if-changed={source}");
 
+        let (archive, length) = compress_file(&out_dir, Path::new(source))?;
         let name = source.rsplit('/').next().unwrap();
-        let archive = format!("{name}.gz");
-        let contents = fs::read(source)?;
-        let mut encoder = GzEncoder::new(contents.as_slice(), Compression::best());
 
-        io::copy(&mut encoder, &mut File::create(out_dir.join(&archive))?)?;
         writeln!(
             manifest,
-            "    ({name:?}, include_bytes!({archive:?}), {}),",
-            contents.len()
+            "    ({name:?}, include_bytes!({archive:?}), {length}),"
         )?;
     }
 
     writeln!(manifest, "]")
 }
 
-fn link_system_rime() {
+fn embed_opencc_files(static_link: bool) -> io::Result<()> {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let mut manifest = File::create(out_dir.join("opencc_files.rs"))?;
+    let data_dir = static_link.then(|| {
+        PathBuf::from(
+            env::var_os("RIME_OPENCC_DATA_DIR").expect("musl builds require RIME_OPENCC_DATA_DIR"),
+        )
+    });
+
+    writeln!(manifest, "&[")?;
+
+    for &name in OPENCC_FILES {
+        if let Some(data_dir) = &data_dir {
+            let path = data_dir.join(name);
+
+            println!("cargo:rerun-if-changed={}", path.display());
+
+            let (archive, _) = compress_file(&out_dir, &path)?;
+
+            writeln!(
+                manifest,
+                "    ({name:?}, Some(include_bytes!({archive:?}))),"
+            )?;
+        } else {
+            writeln!(manifest, "    ({name:?}, None),")?;
+        }
+    }
+
+    writeln!(manifest, "]")
+}
+
+fn compress_file(out_dir: &Path, source: &Path) -> io::Result<(String, usize)> {
+    let archive = format!("{}.gz", source.file_name().unwrap().to_str().unwrap());
+    let contents = fs::read(source)?;
+    let mut encoder = GzEncoder::new(contents.as_slice(), Compression::best());
+
+    io::copy(&mut encoder, &mut File::create(out_dir.join(&archive))?)?;
+
+    Ok((archive, contents.len()))
+}
+
+fn link_system_rime(static_link: bool) {
+    let library_name = if static_link {
+        "librime.a"
+    } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        "librime.dylib"
+    } else {
+        "librime.so"
+    };
     let lib_dir = find_directory(
         "RIME_LIB_DIR",
         &["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"],
-        library_name(),
+        library_name,
     );
+
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=rime");
+
+    if static_link {
+        for library in ["rime", "opencc", "marisa", "leveldb", "yaml-cpp", "stdc++"] {
+            println!("cargo:rustc-link-lib=static={library}");
+        }
+    } else {
+        println!("cargo:rustc-link-lib=dylib=rime");
+    }
 }
 
 fn find_directory(variable: &str, candidates: &[&str], file: &str) -> PathBuf {
@@ -95,14 +162,4 @@ fn find_directory(variable: &str, candidates: &[&str], file: &str) -> PathBuf {
         .find(|directory| directory.join(file).is_file())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| panic!("cannot find {file}; set {variable}"))
-}
-
-#[cfg(target_os = "macos")]
-fn library_name() -> &'static str {
-    "librime.dylib"
-}
-
-#[cfg(not(target_os = "macos"))]
-fn library_name() -> &'static str {
-    "librime.so"
 }

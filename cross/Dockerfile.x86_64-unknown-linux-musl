@@ -1,0 +1,12 @@
+FROM --platform=linux/amd64 ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99
+
+COPY build-musl.sh /usr/local/bin/build-rime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bzip2 make python3 \
+    && sh /usr/local/bin/build-rime \
+    && rm -rf /var/lib/apt/lists/* /usr/local/bin/build-rime
+
+ENV RIME_INCLUDE_DIR=/opt/rime-musl/include \
+    RIME_LIB_DIR=/opt/rime-musl/lib \
+    RIME_OPENCC_DATA_DIR=/opt/rime-musl/share/opencc
