@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -92,70 +93,134 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     let mut input_method = InputMethod::new(config_dir.as_deref())?;
-    let mut size = terminal_size()?;
-    let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system.openpty(size)?;
-    let mut child = pair.slave.spawn_command(command)?;
+    let status = run_proxy(command, &mut input_method)?;
 
-    drop(pair.slave);
-
-    let result = run_proxy(pair.master, &mut child, &mut input_method, &mut size);
-
-    if result.is_err() {
-        let _ = child.kill();
-    }
-
-    result.map(|status| ExitCode::from(status.exit_code().min(u8::MAX as u32) as u8))
+    Ok(ExitCode::from(status.exit_code().min(u8::MAX as u32) as u8))
 }
 
 fn run_proxy(
-    master: Box<dyn MasterPty + Send>,
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    command: CommandBuilder,
     input_method: &mut InputMethod,
-    size: &mut PtySize,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let _raw_mode = RawMode::enable()?;
-    let mut pty_reader = master.try_clone_reader()?;
-    let mut pty_writer = Some(master.take_writer()?);
     let (sender, receiver) = mpsc::channel();
 
-    spawn_reader(
-        sender.clone(),
-        move |buffer| pty_reader.read(buffer),
-        Event::Output,
-        Event::OutputClosed,
-    );
     spawn_reader(
         sender.clone(),
         |buffer| io::stdin().read(buffer),
         Event::Input,
         Event::InputClosed,
     );
-    spawn_resize_listener(sender)?;
 
     let mut stdout = io::stdout().lock();
+    let mut pending_input = Vec::new();
+
+    // Synchronize before forwarding child output, which starts at the terminal's current cursor.
+    stdout.write_all(b"\x1b[6n")?;
+    stdout.flush()?;
+
+    let (column, row) = initial_cursor_position(&receiver, &mut pending_input)?;
+
+    spawn_resize_listener(sender.clone())?;
+
+    // shortcut: a resize between CPR and sizing can shift the cursor; repeat calibration if observed.
+    let mut size = terminal_size()?;
     let mut parser = VtParser::new(size.rows.try_into()?, size.cols.try_into()?, 0);
     let mut popup = None;
+
+    queue!(parser, MoveTo(column, row))?;
+
+    // Leave a blank row above the child so a bottom-edge popup can be restored.
+    stdout.write_all(b"\r\n\r\n")?;
+    stdout.flush()?;
+    parser.process(b"\r\n\r\n");
+
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system.openpty(size)?;
+    let mut pty_reader = pair.master.try_clone_reader()?;
+    let mut pty_writer = Some(pair.master.take_writer()?);
+    let mut child = pair.slave.spawn_command(command)?;
+    let master = pair.master;
+
+    drop(pair.slave);
+
+    spawn_reader(
+        sender,
+        move |buffer| pty_reader.read(buffer),
+        Event::Output,
+        Event::OutputClosed,
+    );
 
     let result = proxy_loop(
         &receiver,
         master.as_ref(),
-        child,
+        &mut child,
         &mut pty_writer,
         &mut stdout,
-        size,
+        &mut size,
         input_method,
         &mut parser,
         &mut popup,
+        pending_input,
     );
 
-    let cleanup = redraw_popup(&mut stdout, parser.screen(), &mut popup, None, *size);
+    let cleanup = redraw_popup(&mut stdout, parser.screen(), &mut popup, None, size);
+
+    if result.is_err() {
+        let _ = child.kill();
+    }
 
     match result {
         Err(error) => Err(error),
         Ok(status) => {
             cleanup?;
             Ok(status)
+        }
+    }
+}
+
+fn initial_cursor_position(
+    receiver: &Receiver<Event>,
+    pending_input: &mut Vec<u8>,
+) -> io::Result<(u16, u16)> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    loop {
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "terminal cursor query timed out")
+            })?;
+        let event = receiver.recv_timeout(timeout).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("cannot query terminal cursor position: {error}"),
+            )
+        })?;
+        let Event::Input(bytes) = event else {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin closed"));
+        };
+
+        pending_input.extend_from_slice(&bytes);
+
+        let report = pending_input
+            .windows(2)
+            .enumerate()
+            .filter(|(_, bytes)| *bytes == b"\x1b[")
+            .find_map(|(start, _)| {
+                let bytes = &pending_input[start + 2..];
+                // Two u16 coordinates, a separator, and R fit in 12 bytes.
+                let length = bytes.iter().take(12).position(|&byte| byte == b'R')?;
+                let (row, column) = str::from_utf8(&bytes[..length]).ok()?.split_once(';')?;
+                let row = row.parse::<u16>().ok()?.checked_sub(1)?;
+                let column = column.parse::<u16>().ok()?.checked_sub(1)?;
+
+                Some((start, start + length + 3, column, row))
+            });
+
+        if let Some((start, end, column, row)) = report {
+            pending_input.drain(start..end);
+            return Ok((column, row));
         }
     }
 }
@@ -187,14 +252,21 @@ fn proxy_loop(
     input_method: &mut InputMethod,
     parser: &mut VtParser,
     popup: &mut Option<Popup>,
+    pending_input: Vec<u8>,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let mut initial_input = Some(pending_input);
     let mut status = None;
     let mut output_closed = false;
     let mut popup_dirty = false;
     let mut last_draw = Instant::now();
 
     while status.is_none() || !output_closed {
-        match receiver.recv_timeout(Duration::from_millis(16)) {
+        let event = match initial_input.take() {
+            Some(bytes) => Ok(Event::Input(bytes)),
+            None => receiver.recv_timeout(Duration::from_millis(16)),
+        };
+
+        match event {
             Ok(Event::Input(bytes)) => {
                 if let Some(writer) = pty_writer {
                     writer.write_all(&input_method.route(&bytes)?)?;
@@ -400,6 +472,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_initial_cursor_without_consuming_keyboard_input() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Event::Input(
+                b"typed\x1b[A\x1b[0;1R\x1b[65536;1R\x1b[24;".to_vec(),
+            ))
+            .unwrap();
+        sender.send(Event::Input(b"5Rafter".to_vec())).unwrap();
+        let mut input = Vec::new();
+
+        assert_eq!(
+            initial_cursor_position(&receiver, &mut input).unwrap(),
+            (4, 23)
+        );
+        assert_eq!(input, b"typed\x1b[A\x1b[0;1R\x1b[65536;1Rafter");
+    }
+
+    #[test]
+    fn cursor_query_reports_closed_input() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Event::InputClosed).unwrap();
+
+        assert_eq!(
+            initial_cursor_position(&receiver, &mut Vec::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
     fn places_popup_below_or_above_cursor() {
         let size = PtySize {
             rows: 3,
@@ -433,6 +536,47 @@ mod tests {
     #[test]
     fn clips_popup_by_display_width() {
         assert_eq!(fit_text(" [中] nihao ", 8), " [中] ni");
+    }
+
+    #[test]
+    fn reserved_popup_row_preserves_existing_output() {
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let rows = size.rows.try_into().unwrap();
+        let cols = size.cols.try_into().unwrap();
+        let mut tracked = VtParser::new(rows, cols, 0);
+        queue!(tracked, MoveTo(0, 23)).unwrap();
+        let mut displayed = VtParser::new(rows, cols, 0);
+        displayed.process(b"\x1b[23;1HPREVIOUS OUTPUT\x1b[24;1H");
+        tracked.process(b"\r\n\r\nprompt> ");
+        displayed.process(b"\r\n\r\nprompt> ");
+        let before = displayed.screen().contents();
+        let mut popup = None;
+        let mut output = Vec::new();
+
+        assert!(before.contains("PREVIOUS OUTPUT"));
+        redraw_popup(
+            &mut output,
+            tracked.screen(),
+            &mut popup,
+            Some("[中] nihao"),
+            size,
+        )
+        .unwrap();
+        displayed.process(&output);
+        output.clear();
+        redraw_popup(&mut output, tracked.screen(), &mut popup, None, size).unwrap();
+        displayed.process(&output);
+
+        assert_eq!(displayed.screen().contents(), before);
+        assert_eq!(
+            displayed.screen().cursor_position(),
+            tracked.screen().cursor_position()
+        );
     }
 
     #[test]
